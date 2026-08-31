@@ -12,10 +12,10 @@
 
 让"我现在库里有哪些 skill、本地跟共享是否一致、哪些 session 触发了 skill 演化、validation 还在等多少"这些信息**可视化**。
 
-**关于"是否写回"的精确表述**(原文档"永远不写回"过于绝对,需要修正):
+**dashboard 的读写边界**:
 
-- **dashboard 视图层(GET 类端点)只读**——`/api/v1/overview` / `/api/v1/skills` / `/api/v1/sessions` / `/api/v1/validation/jobs` / `/api/v1/evolve/status` 全部从 SQLite 读,**不**写。
-- **dashboard 操作层(POST 类端点)**有 **5 个写操作**,每个**显式**走原有 `SkillHub` / `ValidationStore` 路径,**不**直接改 SQLite 之外的真实数据:
+- **视图层(GET 类端点)只读**——`/api/v1/overview` / `/api/v1/skills` / `/api/v1/sessions` / `/api/v1/validation/jobs` / `/api/v1/evolve/status` 全部从 SQLite 读,**不**写。
+- **操作层(POST 类端点)**有 **5 个写操作**,每个**显式**走原有 `SkillHub` / `ValidationStore` 路径,**不**直接改 SQLite 之外的真实数据:
   1. `POST /api/v1/skills/{id}/activate` → `activate_skill_version` → 通过 `hub._bucket` 把历史版本回滚到 `skills/<name>/`(实际**写**到对象存储的 `skills/<name>/`,**写**到本地 `skills_dir`)
   2. `POST /api/v1/ops/export-sessions` → `export_local_sessions` → 通过 `hub._bucket` 把本地 session 上传到对象存储的 `sessions/<sid>.json`
   3. `POST /api/v1/validation/jobs/{job_id}/review` → `submit_validation_review` → 通过 `ValidationStore.save_result` 写 `validation_results/<job_id>/<user_alias>.json`(可能触发 inline finalize)
@@ -23,7 +23,7 @@
   5. `POST /api/v1/ops/push` → `push_skills` → **写**到共享存储的 `skills/<name>/` + 更新 `manifest.jsonl`(走 `SkillHub.push_skills` 路径)
 - **这 5 个写操作都通过原有 `SkillHub` / `ValidationStore` 接口**——dashboard **不**直接调用对象存储 SDK,**不**绕过 push/pull/sync 路径;**它只是给这些操作加了一个 web 入口**。
 
-**结论**:dashboard **不是"只读"**——它是"**通过原有接口的写操作 + 自己的视图层**"两层。读和写都走 `SkillHub` / `ValidationStore` 的同一份代码,不绕路。
+**结论**:dashboard 是"**通过原有接口的写操作 + 自己的视图层**"两层。读和写都走 `SkillHub` / `ValidationStore` 的同一份代码,不绕路;读端不写,写端必须走原接口——**两层都通过原代码路径**。
 
 ---
 
@@ -160,18 +160,55 @@ CREATE TABLE sessions (
 
 ### 3.2 `replace_snapshot(snapshot)`
 
-**全量替换**（不是增量同步）：
+**场景**:`skillclaw dashboard sync` 命令调 `replace_snapshot(snapshot)`——把"snapshot dict"全量替换进 SQLite 投影。这是 dashboard 的"刷新点",sync 之后 dashboard serve 读到的就是新数据。
+
+**4 步全量替换**:
 
 ```python
 def replace_snapshot(self, snapshot):
+    # 段 1:开数据库连接(WAL 模式)
     with self._connect() as conn:
-        # 1. DELETE FROM skills/sessions/validation_* (全表清)
-        # 2. INSERT 每条记录
-        # 3. UPDATE meta SET last_sync = ...
-    return {"skills": skills_count, "sessions": sessions_count, "validation_jobs": ...}
+        # 段 2:全表清(DELETE FROM skills / sessions / validation_*)
+        for table in ["skills", "sessions", "validation_jobs", "validation_results", "validation_decisions"]:
+            conn.execute(f"DELETE FROM {table}")
+
+        # 段 3:逐表 INSERT 每条记录
+        skills_count = self._insert_skills(conn, snapshot.get("skills", []))
+        sessions_count = self._insert_sessions(conn, snapshot.get("sessions", []))
+        # ... 其它表类似
+
+        # 段 4:UPDATE meta SET last_sync = now()
+        conn.execute("UPDATE meta SET last_sync = ?", (iso_now(),))
+        conn.commit()
+
+    return {
+        "skills": skills_count,
+        "sessions": sessions_count,
+        "validation_jobs": ...,
+        "validation_results": ...,
+    }
 ```
 
-**WAL 模式**允许 sync 时 dashboard serve 还在读——读到的要么是旧 snapshot、要么是新 snapshot，**不会半中间状态**。
+**WAL 模式**允许 sync 时 dashboard serve 还在读——读到的要么是旧 snapshot、要么是新 snapshot,**不会半中间状态**(WAL 模式 commit 前的修改对外不可见)。
+
+**为什么是全量替换而不是增量**:
+
+- 增量写容易出"漏 delete / 漏 update" bug——snapshot 源是 local JSON + 共享 storage,可能因为时钟漂移 / 客户端 race 出现"前次同步后又被删了"的 skill
+- 全量替换以 source 为准,简单且**强一致**
+- 缺点是 sync 慢(O(N) 写 SQLite)——但 dashboard 用只读视图,数据量小(几百个 skill + 几千个 session),同步成本低
+
+**关键边界**:
+
+- **sync 时 dashboard serve 在读**:WAL 模式让读端看到旧 snapshot(commit 前),不阻塞
+- **snapshot 缺某表**(某 list 为空):该表全清(段 2 DELETE 后段 3 不 INSERT 任何行)
+- **`last_sync` 时间戳**:给 dashboard 端展示"数据新鲜度"
+- **sync 失败** (写盘失败):抛错,旧 snapshot 保留(rollback 到上一 commit)
+
+**走完之后**:
+
+- SQLite 里 4 张表完全反映新 snapshot
+- `meta.last_sync` 更新到 sync 完成时间
+- dashboard serve 端下次查询看到新数据(WAL commit 之后)
 
 ### 3.3 `get_overview()`
 
@@ -188,14 +225,7 @@ def replace_snapshot(self, snapshot):
 
 ### 3.4 `list_skills(search, category, source, limit)`
 
-```python
-def list_skills(self, search="", category="", source="", limit=500) -> list[dict]:
-    sql = "SELECT * FROM skills WHERE 1=1"
-    args = []
-    if search: sql += " AND (name LIKE ? OR description LIKE ?)"; args += [f"%{search}%"]*2
-    if category: sql += " AND category = ?"; args.append(category)
-    if source: sql += " AND source = ?"; args.append(source)
-    sql += " ORDER BY session_count DESC, observed_injection_count DESC LIMIT ?"; args.append(limit)
+`list_skills(search="", category="", source="", limit=500) -> list[dict]` 走"动态拼 SQL + 排序 limit"两步:第一步 `sql = "SELECT * FROM skills WHERE 1=1"` 起点,`args = []` 累加参数;然后按条件追加——`if search` 追加 `AND (name LIKE ? OR description LIKE ?)` + 2 个 `f"%{search}%"` 参数;`if category` 追加 `AND category = ?` + category;`if source` 追加 `AND source = ?` + source;最后 `ORDER BY session_count DESC, observed_injection_count DESC LIMIT ?` + `args.append(limit)`。
     return [dict(row) for row in conn.execute(sql, args)]
 ```
 
@@ -263,7 +293,7 @@ def activate_skill_version(self, skill_id, *, target) -> dict:
     write_skill_bundle(skill_root, bundle_files, clean=True)
 ```
 
-**这是 dashboard 的"危险操作"**——把一个 skill 回滚到历史版本。`POST /api/v1/skills/{skill_id}/activate` 路由，body `{"target": "3"}` 触发。
+**这是 dashboard 的"危险操作"**——把一个 skill 回滚到历史版本。`POST /api/v1/skills/{skill_id}/activate` 路由，body `{"target": "3"}` 触发。这条操作与 [41 章 §9.2 "dashboard 的 `activate_skill_version` 是反向操作（v<N> → current）"](../04-端到端/41-部署形态.md) 是同一条操作的两面——22 章讲"怎么调"、41 章讲"它对 manifest / registry 的影响和回滚约束"。
 
 ### 4.6 `submit_validation_review(job_id, accepted, score, notes, auto_finalize)`
 

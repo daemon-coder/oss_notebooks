@@ -27,20 +27,7 @@
 
 ### 1.1 `_resolve_tui_session(model, msg_count)`
 
-TUI 类客户端（不发 `X-Session-Id`）的伪 session 检测：
-
-```python
-# 伪代码骨架（见 api_server.py:_resolve_tui_session）:
-async def _resolve_tui_session(self, model, msg_count):
-    tui_key = f"tui-{model}"
-    meta = self._tui_session_meta.get(tui_key)
-    # 第一次见 / 跨对话边界 → 分配新 session
-    if meta is None or is_tui_boundary(meta, msg_count):
-        await self._close_session(meta["session_id"], reason="tui_boundary")
-        return allocate_new_session(tui_key, msg_count)
-    # 否则复用 + 更新 msg_count / last_request_time
-    return meta["session_id"]
-```
+TUI 类客户端(不发 `X-Session-Id`)的伪 session 检测:`_resolve_tui_session(model, msg_count)` 走"取 meta + 判 boundary + 分配新/复用"三步——第一步 `tui_key = f"tui-{model}"` + `meta = self._tui_session_meta.get(tui_key)` 拿元数据;第二步 `if meta is None or is_tui_boundary(meta, msg_count):`(第一次见 / 跨对话边界)就 `await self._close_session(meta["session_id"], reason="tui_boundary")` + `return allocate_new_session(tui_key, msg_count)` 显式关老 + 分配新;否则第三步复用 `meta["session_id"]` 并更新 `msg_count` / `last_request_time`。
 
 **关键不变量**：
 - **同一 `tui-<model>` 永远只对应一个活跃 session**——切新时**显式 close 老 session**
@@ -79,39 +66,44 @@ def _collect_idle_session_ids(self, now=None) -> list[str]:
 
 `_session_idle_close_seconds` 可以从 config 读 `session_idle_close_seconds`（**config 字段没在 `SkillClawConfig` 暴露**——**待确认**是否遗漏），否则用模块级默认 180s。
 
-`_session_idle_sweeper_loop` 每 `_session_sweep_interval_seconds`（默认 15s）扫一次：
-
-```python
-while True:
-    await asyncio.sleep(self._session_sweep_interval_seconds)
-    for sid in self._collect_idle_session_ids():
-        await self._close_session(sid, reason="idle_timeout")
-```
+`_session_idle_sweeper_loop` 每 `_session_sweep_interval_seconds`(默认 15s)扫一次,走"while True 循环"框架:循环体第一步 `await asyncio.sleep(self._session_sweep_interval_seconds)`,第二步遍历 `self._collect_idle_session_ids()` 拿到的所有 idle session id,逐个 `await self._close_session(sid, reason="idle_timeout")`。
 
 **关掉 idle 关闭**：`config.session_idle_close_seconds <= 0` 时整个 sweeper 不启（`_start_session_idle_sweeper` 直接 return）。
 
 ## 3. `_close_session` 全流程
 
+**场景**:session 要关(显式 `X-Session-Done: true` / idle 超时 180s / 进程关闭)——SkillClaw 需要把这个 session 的"完整状态"落盘 + 上传,这样 evolve server 才能拿到完整证据做摘要。
+
+**为什么是"防重入 + 7 步收尾"**:
+
+session 关闭不是原子操作(PRM 异步 + 文件 IO + 网络上传),并发场景下同一个 session 可能被两个触发源同时关——**防重入保护**保证 7 步不被并发跑两遍。
+
+7 步收尾的具体细节见 [40 章 §2.5](../04-端到端/40-数据流总览.md) ——本节只讲 14 章特有的细节。
+
+**怎么走**:
+
 ```python
-# 伪代码骨架（见 api_server.py:_close_session）:
-async def _close_session(session_id, reason="explicit"):
-    防重入 + 7 步收尾:
-      1. _flush_pending_record → conversations.jsonl 最后一行
-      2. 触发 pending turn 的 PRM（record-only 路径）
-      3. drain PRM (最多 15s)
-      4. finalize turn → prm_scores.jsonl + record_feedback
-      5. SkillManager._save_stats() 强制刷盘
-      6. _upload_session_data + _pull_skills_from_cloud
-      7. 清 7 个 session_id 状态表
+async def _close_session(self, session_id, reason="explicit"):
+    if session_id in self._closing_sessions:
+        return  # 防重入
+    self._closing_sessions.add(session_id)
+    try:
+        # 7 步收尾
+        await self._flush_pending_record(session_id, next_state=None)  # §3.1
+        # 启动 PRM + drain + finalize + save_stats
+        # 上传 session + 拉新 skill
+        # 清状态
+    finally:
+        self._closing_sessions.discard(session_id)
 ```
 
 ### 3.1 `_flush_pending_record(session_id, next_state)`
 
-把当前 turn 的 record 缓冲（`_pending_records[session_id]`）写一行到 `conversations.jsonl`。`next_state=None` 标志"这是最后一次 flush"——**不**触发新 PRM（只把当前 turn 的 record 落盘）。
+把当前 turn 的 record 缓冲(`_pending_records[session_id]`)写一行到 `conversations.jsonl`。`next_state=None` 标志"这是最后一次 flush"——**不**触发新 PRM(只把当前 turn 的 record 落盘)。
 
 ### 3.2 PRM 同步 drain
 
-session 关闭时还要等正在跑的 PRM task 跑完（最多 15s）——这样能让最后一轮 PRM 分数回灌 `SkillManager._stats`。**超时 15s 后强制 finalize**（用 `prm_result = None` 走 fallback 分支）。
+session 关闭时还要等正在跑的 PRM task 跑完(最多 15s)——这样能让最后一轮 PRM 分数回灌 `SkillManager._stats`。**超时 15s 后强制 finalize**(用 `prm_result = None` 走 fallback 分支)。
 
 ### 3.3 SkillManager 写盘
 
@@ -119,24 +111,37 @@ session 关闭时还要等正在跑的 PRM task 跑完（最多 15s）——这�
 if self.skill_manager: self.skill_manager._save_stats()
 ```
 
-强制把 `_stats` 写回 `skill_stats.json`（不管 `_maybe_flush_stats` 的 10-mutation 阈值）。
+强制把 `_stats` 写回 `skill_stats.json`(不管 `_maybe_flush_stats` 的 10-mutation 阈值)。
 
 ### 3.4 Session 上传
 
+`_upload_session_data(session_id, turns) -> bool` 走"取 hub + 构 payload + put_object"3 步:
+
 ```python
 async def _upload_session_data(self, session_id, turns) -> bool:
+    # 段 1:取 hub
     hub = SkillHub.object_storage_from_config(self.config)
-    if hub is None: return False
-    payload = {"session_id": session_id, "timestamp": "<UTC ISO-8601>",
-               "user_alias": "...", "num_turns": len(turns), "turns": turns}
-    hub._bucket.put_object(f"{hub._prefix()}sessions/{session_id}.json",
-                           json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    if hub is None:
+        return False  # Nacos 不存 session 资产
+
+    # 段 2:构 payload(5 字段)
+    payload = {
+        "session_id": session_id,
+        "timestamp": iso_utc_now(),
+        "user_alias": self.config.user_alias,
+        "num_turns": len(turns),
+        "turns": turns,  # list[dict]
+    }
+
+    # 段 3:put_object 写
+    key = f"{hub._prefix()}sessions/{session_id}.json"
+    hub._bucket.put_object(key, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
     return True
 ```
 
-- **走 `SkillHub.object_storage_from_config`**——这是"非 Nacos" 的对象存储后端。Nacos 不存 session 资产。
-- key 格式：`{group_id}/sessions/{session_id}.json`
-- 失败不重试（**待确认**——这一行 `return False` 后上层 caller 不看返回值）
+**走 `SkillHub.object_storage_from_config`**——这是"非 Nacos"的对象存储后端。Nacos 不存 session 资产。**key 格式**:`{group_id}/sessions/{session_id}.json`。
+
+**失败不重试**(这一行 `return False` 后上层 caller 不看返回值)——**待确认**(是否应该重试)。
 
 ### 3.5 拉新 skill
 
@@ -144,18 +149,39 @@ async def _upload_session_data(self, session_id, turns) -> bool:
 self._safe_create_task(self._pull_skills_from_cloud(skip_names=modified_skill_names))
 ```
 
-session 关闭时**也**触发一次 pull——这样"用户改了一个 skill" → "下次 session 关闭" → "本地立刻拉到新版"。`skip_names` 跳过本 session 内被模型**修改**的 skill，避免覆盖用户刚改的本地版。
+session 关闭时**也**触发一次 pull——这样"用户改了一个 skill" → "下次 session 关闭" → "本地立刻拉到新版"。`skip_names` 跳过本 session 内被模型**修改**的 skill,避免覆盖用户刚改的本地版。
 
 ### 3.6 状态清理顺序
 
+状态清理按"idle tracker 最后清 + TUI 元数据也清"两步:
+
 ```python
-self._session_last_active.pop(...)   # 最后才清 idle tracker
-for meta in _tui_session_meta:
-    if meta["session_id"] == session_id:
-        _tui_session_meta.pop(key)   # TUI 元数据也清
+# 段 1:收尾清 idle tracker
+self._session_last_active.pop(session_id, None)
+# 确保别的线程的 sweeper 看不到这条
+
+# 段 2:清 TUI 元数据(只清本 session 关联的)
+for key, meta in list(self._tui_session_meta.items()):
+    if meta.get("session_id") == session_id:
+        self._tui_session_meta.pop(key)
 ```
 
-`_closing_sessions.discard(session_id)` 在 `finally` 块，保证重入保护的恢复。
+`_closing_sessions.discard(session_id)` 在 `finally` 块,保证重入保护的恢复。
+
+**关键边界**:
+
+- **session 正在 `_close_session` 流程中**(并发场景):`if session_id in self._closing_sessions: return` 早返
+- **PRM drain 超时 15s**:强制 finalize(用 None 兜底)
+- **session 上传失败**:`return False` 但 caller 不看——**待确认**是否要修
+- **`skip_names`**:跳过本 session 内被模型改的 skill,避免覆盖
+
+**走完之后**:
+
+- 内存 7 个状态 dict 清掉 `session_id` 记录
+- 共享存储 `sessions/<sid>.json` 写好(给 evolve server 下一轮 cycle 拉)
+- 本地 `prm_scores.jsonl` 累加完本 session 的所有 turn 分
+- 本地 `skill_stats.json` 刷盘
+- 本地 SkillManager 可能已拉到新 skill
 
 ## 4. Record 与 PRM 的双文件
 

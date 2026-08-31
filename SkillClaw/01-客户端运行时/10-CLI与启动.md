@@ -2,14 +2,14 @@
 
 ## 术语速查(读本章前 1 分钟过一遍)
 
-> 详细定义见 02 章核心概念词典;这里只给最简释义,方便第一次读到时不卡住。
+> 本章新引入的内部概念(`SetupWizard` / `daemon.start.lock` 等)只给最简释义;通用术语(PRM / Claw / Two Loops / Sharing Backend / Skill Backend)的权威定义见 [02 章 核心概念词典](../00-总览/02-核心概念词典.md)。
 
-- **PRM (Process Reward Model)** —— 用第三方 LLM(OpenAI-compatible `/v1/chat/completions` 端点)对单条 turn 打 +1/-1/0,跑 `prm_m=3` 票取多数票。详见 16 章。
+- **PRM (Process Reward Model)** —— 用第三方 LLM(OpenAI-compatible `/v1/chat/completions` 端点)对单条 turn 打 +1/-1/0,跑 `prm_m=3` 票取多数票。详见 16 章。(PRM 概念详见 [02 章 §10](../00-总览/02-核心概念词典.md))
 - **Bedrock** —— AWS Bedrock 托管的 LLM 服务(Amazon 的模型市场)。当 `llm.provider == "bedrock"` 时,SkillClaw 用 `BedrockChatClient` + AWS region 调上游,不走 OpenAI 协议。
-- **Claw** —— SkillClaw 对它所代理的本地 CLI agent 框架的统称(OpenClaw / Hermes / Claude Code / Codex / OpenCode / QwenPaw / IronClaw / PicoClaw / ZeroClaw / NanoClaw / NemoClaw / `none`)。
-- **Two Loops** —— 任务时 loop(`SkillClawAPIServer` 实时) + 演化时 loop(`evolve_server` 后台),通过共享存储通信。
-- **Sharing Backend** —— 客户端"通用对象存储"后端:`local` / `s3` / `oss` / `nacos`(nacos 仅承载 skill 资产)。
-- **Skill Backend** —— `sharing.skill_backend` 单字段覆盖,允许"skill 在 Nacos、session 在 OSS"的混合部署。
+- **Claw** —— SkillClaw 对它所代理的本地 CLI agent 框架的统称(OpenClaw / Hermes / Claude Code / Codex / OpenCode / QwenPaw / IronClaw / PicoClaw / ZeroClaw / NanoClaw / NemoClaw / `none`)。(详见 [02 章 §5 / §6](../00-总览/02-核心概念词典.md))
+- **Two Loops** —— 任务时 loop(`SkillClawAPIServer` 实时) + 演化时 loop(`evolve_server` 后台),通过共享存储通信。(详见 [02 章 §7](../00-总览/02-核心概念词典.md))
+- **Sharing Backend** —— 客户端"通用对象存储"后端:`local` / `s3` / `oss` / `nacos`(nacos 仅承载 skill 资产)。(详见 [02 章 §12](../00-总览/02-核心概念词典.md))
+- **Skill Backend** —— `sharing.skill_backend` 单字段覆盖,允许"skill 在 Nacos、session 在 OSS"的混合部署。(详见 [02 章 §13](../00-总览/02-核心概念词典.md))
 - **SetupWizard** —— `setup_wizard.py:SetupWizard.run()` 交互式首次配置,**问 28 个问题**(详见 §2),用户全回车走默认也能跑通。
 
 ## 技术栈速查
@@ -240,15 +240,43 @@ skillclaw
 
 ### 3.1 `start`(前台运行)
 
+**场景**:用户在终端敲 `skillclaw start`(不带 `--daemon`)——server 在前台跑,Ctrl-C 触发优雅退出。
+
+**为什么是"起 launcher + 跑 start + 接 Ctrl-C"3 步**:
+
+- **段 1 构造 launcher**:`SkillClawLauncher(cs)` 接收 `ConfigStore`,内部组装 SkillClawAPIServer + validation worker + claw_adapter
+- **段 2 跑 launcher**:launcher.start() 内部按"先 claw_adapter 改写 → 再起 SkillClawAPIServer → 再起 validation worker" 顺序跑
+- **段 3 接 Ctrl-C**:KeyboardInterrupt 触发后,调 `launcher.stop()` 优雅退出(等价于 §3.5 `_shutdown_cleanup`)
+
+**怎么走**:
+
 ```python
+# 段 1:构造 launcher
 launcher = SkillClawLauncher(cs)
+
+# 段 2:跑 launcher 的 async 入口
 try:
     asyncio.run(launcher.start())
+    # launcher 内部:
+    #   1. 跑 claw_adapter 改写 12 种 agent 配置
+    #   2. 起 SkillClawAPIServer(uvicorn)
+    #   3. 起 validation worker(后台 task)
 except KeyboardInterrupt:
-    launcher.stop()
+    # 段 3:Ctrl-C 触发
+    launcher.stop()  # 调 _shutdown_cleanup
 ```
 
-如果传了 `--port`，临时把 `proxy.port` 写到 NamedTemporaryFile YAML、构造临时 `ConfigStore`、用完 unlink——**不污染**用户配置。
+**`--port` 临时覆盖**:
+
+如果传了 `--port`,临时把 `proxy.port` 写到 NamedTemporaryFile YAML、构造临时 `ConfigStore`、用完 unlink——**不污染**用户配置(用户 config.yaml 不动)。
+
+**关键边界**:
+
+- **Ctrl-C 一次**:KeyboardInterrupt 抛出,launcher.stop() 收尾(server 关闭 + session 排空)
+- **Ctrl-C 多次**:`asyncio.run` 第二次 KeyboardInterrupt 抛 `RuntimeError`("Event loop stopped")——让用户知道"server 强退"
+- **`asyncio.run` 创建新 event loop**:每次调 start 都新建 event loop(不共享全局 loop)
+- **daemon 模式**:用 `--daemon` 走 §3.2 双 fork 路径,本节是前台路径
+- **`launcher.stop()` 异常**:_shutdown_cleanup 内部 try/except,不让 shutdown 失败阻断进程退出
 
 ### 3.2 `start --daemon`（后台守护进程）
 

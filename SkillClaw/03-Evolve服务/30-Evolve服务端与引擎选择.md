@@ -161,62 +161,95 @@ class EvolveServerConfig:
 
 ### 3.2 `from_skillclaw_config(skillclaw_config)`
 
-复用 `SkillClawConfig` 的 sharing + LLM 字段。映射规则：
+**场景**:用户已经在跑 SkillClawAPIServer(`~/.skillclaw/config.yaml` 配好了 sharing + LLM 字段),想顺便在同一台机器起 evolve server——**不**想再配一遍 evolve 的 LLM 字段。`from_skillclaw_config` 把 SkillClaw 的 config 字段映射到 `EvolveServerConfig`,**复用**已有配置。
+
+**`_build_config_from_args` 4 步映射规则**:
 
 ```python
-# 伪代码骨架（见 evolve_server/core/config.py:_build_config_from_args）:
-def _build_config_from_args(args):
-    # 1. 读 sharing_* / llm_* / engine=agent → AGENT_EVOLVE_* 优先
-    # 2. storage_endpoint 禁用 nacos（避免 endpoint 复用冲突）
-    # 3. storage_backend 隐式推断: session_backend > local_root > sharing_backend > endpoint 域名
-    # 4. LLM key/base_url/model fallback: llm_* → prm_* → env
+def _build_config_from_args(args, skillclaw_config=None) -> EvolveServerConfig:
+    # 段 1:读 sharing_* + llm_* + engine=agent
+    #   engine="agent" 时,AGENT_EVOLVE_* env 优先于 EVOLVE_*
+    sharing_args = read_sharing_args(args, skillclaw_config)
+    llm_args = read_llm_args(args, skillclaw_config, engine=args.engine)
+
+    # 段 2:storage_endpoint 禁用 nacos
+    #   Nacos 不是对象存储接口,放 storage_endpoint 会冲突
+    if sharing_args.sharing_backend == "nacos" and not sharing_args.session_backend:
+        sharing_args.storage_endpoint = ""
+
+    # 段 3:storage_backend 隐式推断
+    #   顺序: session_backend > local_root > sharing_backend > endpoint 域名
+    storage_backend = infer_storage_backend(sharing_args)
+
+    # 段 4:LLM fallback 链
+    #   key / base_url / model: llm_* → prm_* → env
+    llm_key, llm_base, llm_model = resolve_llm_fallback(llm_args)
+
     return EvolveServerConfig(...)
 ```
 
-**关键设计**：
-- `sharing_backend="nacos"` 但 `session_backend` 没设 → `storage_endpoint=""`（强制 server 走 local/OSS/S3 之一）
-- `sharing_backend="nacos"` + `session_backend="local"` → server 用 local
-- `sharing_backend="oss"` + 没有其它 → server 推断为 `oss`
+**关键设计**(`storage_backend` 推断规则):
+
+| sharing_backend | session_backend | 推断结果 |
+|---|---|---|
+| `nacos` | 没设 | `""`(空 string) → 强制 server 走 local/OSS/S3 之一 |
+| `nacos` | `local` | `local` |
+| `oss` | 没设 | `oss` |
+| 任意 | 设了 | 用 `session_backend` |
+
+**LLM fallback 链**(避免重复配):
+
+`llm_key` / `llm_base_url` / `llm_model` 三个字段按 `llm_*` → `prm_*` → `env` 顺序回退——**优先用 llm_***(SkillClaw 主 LLM),**没有**才用 `prm_*`(PRM 用的 LLM),**还没有**才用 `env`。
+
+**关键边界**:
+
+- **SkillClaw config 没配 LLM 字段** (罕见):fallback 到 env vars
+- **`engine="agent"` + `AGENT_EVOLVE_LLM_API_KEY` 设了**:env 覆盖 skillclaw_config
+- **`sharing_backend="nacos"` + `session_backend="local"`** (混合部署):走 `from_skillclaw_config` 自动推断
+- **storage_endpoint 是 Nacos URL** (误配):`_build_config_from_args` 会覆盖为空 string
 
 ## 4. 引擎选择
 
-### 4.1 `workflow`（默认）
+### 4.1 `workflow`(默认)
+
+`EvolveServer` 继承 `EvolveEngineMixin`,`__init__` 走"config + 5 个子对象初始化":
 
 ```python
 class EvolveServer(EvolveEngineMixin):
-    def __init__(self, config, *, mock=False, mock_root=None):
+    def __init__(self, config: EvolveServerConfig, mock: bool = False, mock_root: str | None = None):
         self.config = config
-        self._bucket = self._build_bucket(config, mock, mock_root)
+        self._bucket = self._build_bucket(config, mock, mock_root)  # mock/OSS/S3/local
         self._prefix = f"{config.group_id}/"
-        self._llm = AsyncLLMClient(...)
-        self._validation_store = ValidationStore(...)
-        self._id_registry = SkillIDRegistry()
-        # 非 Nacos 模式: 启动时 load 已有 registry
+        self._llm = AsyncLLMClient(...)  # LLM 客户端
+        self._validation_store = ValidationStore(...)  # 验证存储
+        self._id_registry = SkillIDRegistry()  # ID registry
+        # 非 Nacos 模式启动时 load 已有 registry
 ```
 
-`run_once()`：
-1. `_drain_sessions()`（共享基类）
-2. `summarize_sessions_parallel(self._llm, sessions)`
-3. `_run_session_judge(sessions)`（如果 use_session_judge=True）
-4. `aggregate_sessions_by_skill(sessions)`
-5. 逐个 skill group：`_evolve_skill_group(name, sessions, existing_skill_names)`
-6. `_handle_no_skill_sessions(no_skill_bucket, existing_skill_names)`
-7. `_finalize_validation_jobs()`（如果 publish_mode=validated）
-8. `_id_registry.save_to_oss(...)`（非 Nacos）
-9. `delete_session_keys(...)`（无处理错误时）
-10. `_append_history(summary)`（写 `evolve_history.jsonl`）
-11. `if uploaded_skills > 0: _notify_proxy_reload()`
-
-详见 [31 · Workflow 引擎详解](31-Workflow引擎详解.md)。
+`run_once` 11 步详见 [31 · Workflow 引擎详解](31-Workflow引擎详解.md) §1。
 
 ### 4.2 `agent`
 
+`AgentEvolveServer` 继承 `EvolveEngineMixin`,`__init__` 走"workspace + runner + session_id 3 步":
+
 ```python
 class AgentEvolveServer(EvolveEngineMixin):
-    def __init__(self, config, *, mock=False, mock_root=None):
+    def __init__(self, config, mock=False, mock_root=None):
+        # 段 1:构造工作区
         self._workspace = AgentWorkspace(config.workspace_root)
-        self._runner = OpenClawRunner(openclaw_bin=..., openclaw_home=..., fresh=..., timeout=..., llm_*, llm_api_type=...)
-        self._agent_session_id = f"evolve-{config.group_id}"  # 跨轮记忆用
+
+        # 段 2:构造 OpenClaw runner
+        self._runner = OpenClawRunner(
+            openclaw_bin=config.openclaw_bin,
+            openclaw_home=config.openclaw_home,
+            fresh=config.fresh,
+            timeout=config.timeout,
+            llm_api_key=..., llm_base_url=..., llm_model=..., llm_api_type=...,
+        )
+
+        # 段 3:算跨轮记忆用的稳定 session_id
+        self._agent_session_id = f"evolve-{config.group_id}"
+        # 同一 group 跨多次 cycle 用相同 session_id(配合 --no-fresh 模式读 MEMORY.md)
 ```
 
 `run_once()`：
@@ -245,23 +278,33 @@ class AgentEvolveServer(EvolveEngineMixin):
 
 **注意**：`agent` 引擎需要 `openclaw` 在 PATH（`openclaw_bin`），且 LLM 能调通 OpenClaw 的 chat 接口。
 
-## 5. `EvolveEngineMixin`：两种引擎的共用基类
+## 5. `EvolveEngineMixin`:两种引擎的共用基类
 
-`engines/common.py`：
+`engines/common.py`:`EvolveEngineMixin` 提供 5 个核心方法(2 个引擎共用):
+
+| 方法 | 功能 | 用在哪 |
+|---|---|---|
+| `_build_bucket(config, mock, mock_root)` | 选 `LocalBucket(mock)` / `build_object_store(oss/s3/local)` | 构造 storage 抽象层 |
+| `_uses_local_storage()` | 判定走同步还是异步 | `backend=="local" or self._mock or (LocalBucket + local_root)` |
+| `_call_storage(func, *args)` | 调 storage——local 同步 / remote 走 `asyncio.to_thread` | 所有 storage IO 入口 |
+| `_append_history(summary)` | 写 `evolve_history.jsonl`(失败只 logger.warning 不 raise) | Stage 8 finalize |
+| `_drain_sessions()` | 列 sessions(`list_session_keys` + `read_json_object` → `(sessions, keys)`) | Stage 1 |
+
+**辅助方法**:`_load_remote_skills`(读 manifest)/ `_sanitise_name`(规范化 skill name)/ `_call_storage_async` 包装等。
+
+**`_call_storage` 的 local/remote 分支**(最常用方法,每段 storage IO 都走它):
 
 ```python
-# 伪代码骨架（见 evolve_server/engines/common.py:EvolveEngineMixin）:
-class EvolveEngineMixin:
-    # 5 个核心方法:
-    _build_bucket:    选 LocalBucket(mock) / build_object_store(oss/s3/local)
-    _uses_local_storage: backend=="local" or self._mock or (LocalBucket + local_root)
-    _call_storage:    local 同步 / remote 走 asyncio.to_thread
-    _append_history:  写 evolve_history.jsonl (失败 log warning 不 raise)
-    _drain_sessions:  list_session_keys + read_json_object → (sessions, keys)
-    # + _load_remote_skills / _sanitise_name 等辅助
+async def _call_storage(self, func, *args):
+    if self._uses_local_storage():
+        return func(*args)  # local 同步
+    return await asyncio.to_thread(func, *args)  # remote 异步
 ```
 
-**`_call_storage`**：local store 同步调用（filesystem 够快），remote store 走 `asyncio.to_thread`（OSS/S3 是阻塞 I/O）。**`AsyncLLMClient` 自己也用 `asyncio.to_thread`**——所以 OSS 读和 LLM 调都是非阻塞的。
+- **local store** (filesystem) 走同步——filesystem 调够快,放线程池反而引入 context switch 开销
+- **remote store** (OSS / S3) 走 `asyncio.to_thread`——boto3 / oss SDK 是阻塞,不放线程池会卡死 event loop
+
+**`AsyncLLMClient` 自己也用 `asyncio.to_thread`**——所以 OSS 读和 LLM 调都是非阻塞的。event loop 同时跑 cycle / HTTP / session 簿记都不卡。
 
 ## 6. 完整启动示例
 
